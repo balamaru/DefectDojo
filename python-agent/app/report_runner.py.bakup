@@ -1,0 +1,1589 @@
+#!/usr/bin/env python3
+"""
+report_runner.py — Advanced PDF Report Generator
+Wazuh Vulnerability + DDoS Report
+
+Features:
+- Cover page dengan branding
+- Executive Summary detail
+- Charts: bar, pie, trend, heatmap
+- All agents dikelompokkan per severity
+- Top 10 agent detail CVE
+- Malicious IP section
+- DefectDojo import summary
+"""
+
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import mm, cm
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+    PageBreak, HRFlowable, Image, KeepTogether
+)
+from reportlab.platypus.flowables import Flowable
+from reportlab.pdfgen import canvas as rl_canvas
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import numpy as np
+
+from datetime import datetime, date, timedelta
+from pathlib import Path
+from typing import Optional
+import json
+import io
+import requests
+import warnings
+from requests.auth import HTTPBasicAuth
+
+# ── try import config from app package, fallback to local ──
+try:
+    from app.config import settings
+except ImportError:
+    from config import settings
+
+OUTPUT_DIR = Path("/home/bakti/wazuh-report-worker/output")
+TMP_DIR    = Path("/home/bakti/wazuh-report-worker/tmp")
+
+warnings.filterwarnings("ignore", message="Unverified HTTPS request")
+
+# COLOUR PALETTE
+C_CRITICAL  = colors.HexColor("#C0392B")
+C_HIGH      = colors.HexColor("#E67E22")
+C_MEDIUM    = colors.HexColor("#F1C40F")
+C_LOW       = colors.HexColor("#2ECC71")
+C_INFO      = colors.HexColor("#3498DB")
+C_DARK      = colors.HexColor("#1A1A2E")
+C_ACCENT    = colors.HexColor("#0F3460")
+C_ACCENT2   = colors.HexColor("#16213E")
+C_WHITE     = colors.white
+C_LIGHT     = colors.HexColor("#F5F6FA")
+C_BORDER    = colors.HexColor("#D5D8DC")
+C_TEXT      = colors.HexColor("#2C3E50")
+C_MUTED     = colors.HexColor("#7F8C8D")
+
+SEV_COLOR_MAP = {
+    "Critical": C_CRITICAL,
+    "High":     C_HIGH,
+    "Medium":   C_MEDIUM,
+    "Low":      C_LOW,
+}
+SEV_HEX_MAP = {
+    "Critical": "#C0392B",
+    "High":     "#E67E22",
+    "Medium":   "#F1C40F",
+    "Low":      "#2ECC71",
+}
+
+# CUSTOM FLOWABLES
+
+class ColorBar(Flowable):
+    """Horizontal colored bar used as section divider."""
+    def __init__(self, width, height=4, color=C_ACCENT):
+        super().__init__()
+        self.bar_width  = width
+        self.bar_height = height
+        self.color      = color
+
+    def draw(self):
+        self.canv.setFillColor(self.color)
+        self.canv.rect(0, 0, self.bar_width, self.bar_height, fill=1, stroke=0)
+
+    def wrap(self, *args):
+        return self.bar_width, self.bar_height
+
+
+class SeverityBadge(Flowable):
+    """Inline severity badge pill."""
+    def __init__(self, text, sev="High"):
+        super().__init__()
+        self.text  = text
+        self.color = SEV_COLOR_MAP.get(sev, C_INFO)
+        self.w     = 70
+        self.h     = 16
+
+    def draw(self):
+        self.canv.setFillColor(self.color)
+        self.canv.roundRect(0, 0, self.w, self.h, 4, fill=1, stroke=0)
+        self.canv.setFillColor(colors.white)
+        self.canv.setFont("Helvetica-Bold", 8)
+        self.canv.drawCentredString(self.w / 2, 4, self.text)
+
+    def wrap(self, *args):
+        return self.w, self.h
+
+
+# STYLE FACTORY
+
+def make_styles():
+    base = getSampleStyleSheet()
+
+    def ps(name, **kw):
+        return ParagraphStyle(name, **kw)
+
+    return {
+        "cover_title": ps("cover_title",
+            fontSize=32, fontName="Helvetica-Bold",
+            textColor=C_WHITE, alignment=TA_CENTER, leading=40),
+        "cover_sub": ps("cover_sub",
+            fontSize=14, fontName="Helvetica",
+            textColor=colors.HexColor("#BDC3C7"), alignment=TA_CENTER, leading=20),
+        "cover_meta": ps("cover_meta",
+            fontSize=10, fontName="Helvetica",
+            textColor=colors.HexColor("#95A5A6"), alignment=TA_CENTER),
+        "h1": ps("h1",
+            fontSize=16, fontName="Helvetica-Bold",
+            textColor=C_ACCENT, spaceBefore=14, spaceAfter=6),
+        "h2": ps("h2",
+            fontSize=12, fontName="Helvetica-Bold",
+            textColor=C_ACCENT2, spaceBefore=10, spaceAfter=4),
+        "h3": ps("h3",
+            fontSize=10, fontName="Helvetica-Bold",
+            textColor=C_TEXT, spaceBefore=6, spaceAfter=2),
+        "body": ps("body",
+            fontSize=9, fontName="Helvetica",
+            textColor=C_TEXT, leading=14),
+        "body_small": ps("body_small",
+            fontSize=8, fontName="Helvetica",
+            textColor=C_TEXT, leading=12),
+        "muted": ps("muted",
+            fontSize=8, fontName="Helvetica",
+            textColor=C_MUTED, leading=11),
+        "kpi_value": ps("kpi_value",
+            fontSize=28, fontName="Helvetica-Bold",
+            textColor=C_ACCENT, alignment=TA_CENTER),
+        "kpi_label": ps("kpi_label",
+            fontSize=8, fontName="Helvetica",
+            textColor=C_MUTED, alignment=TA_CENTER),
+        "toc": ps("toc",
+            fontSize=10, fontName="Helvetica",
+            textColor=C_TEXT, leading=18, leftIndent=10),
+        "footer": ps("footer",
+            fontSize=7, fontName="Helvetica",
+            textColor=C_MUTED, alignment=TA_CENTER),
+        "tag": ps("tag",
+            fontSize=7, fontName="Helvetica-Bold",
+            textColor=C_WHITE, alignment=TA_CENTER),
+    }
+
+
+# CHART GENERATORS  (return PIL-compatible Image flowable)
+
+def _fig_to_image(fig, width_pt=480, height_pt=200):
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight",
+                facecolor=fig.get_facecolor())
+    buf.seek(0)
+    plt.close(fig)
+    return Image(buf, width=width_pt, height=height_pt)
+
+
+def chart_top_agents_bar(top_agents: list, top_n=10) -> Image:
+    agents   = [a["agent_name"][:18] for a in top_agents[:top_n]]
+    critical = [a.get("critical_cve_count", 0) for a in top_agents[:top_n]]
+    high     = [a.get("high_cve_count", 0)     for a in top_agents[:top_n]]
+
+    x   = np.arange(len(agents))
+    w   = 0.4
+    fig, ax = plt.subplots(figsize=(10, 3.5), facecolor="#F5F6FA")
+    ax.set_facecolor("#F5F6FA")
+
+    b1 = ax.bar(x - w/2, critical, w, label="Critical", color="#C0392B", zorder=3)
+    b2 = ax.bar(x + w/2, high,     w, label="High",     color="#E67E22", zorder=3)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(agents, rotation=35, ha="right", fontsize=8)
+    ax.set_ylabel("CVE Count", fontsize=9)
+    ax.set_title(f"Top {top_n} Agents by Vulnerability Count", fontsize=11, fontweight="bold", pad=10)
+    ax.legend(fontsize=8)
+    ax.grid(axis="y", alpha=0.4, zorder=0)
+    ax.spines[["top","right"]].set_visible(False)
+
+    for bar in b1:
+        if bar.get_height() > 0:
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3,
+                    str(int(bar.get_height())), ha="center", va="bottom", fontsize=7)
+    for bar in b2:
+        if bar.get_height() > 0:
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3,
+                    str(int(bar.get_height())), ha="center", va="bottom", fontsize=7)
+
+    fig.tight_layout()
+    return _fig_to_image(fig, 480, 200)
+
+
+def chart_severity_pie(vuln_summary: dict) -> Image:
+    labels = ["Critical", "High", "Medium", "Low"]
+    values = [
+        vuln_summary.get("critical_count", 0),
+        vuln_summary.get("high_count",     0),
+        vuln_summary.get("medium_count",   0),
+        vuln_summary.get("low_count",      0),
+    ]
+    c_vals   = ["#C0392B","#E67E22","#F1C40F","#2ECC71"]
+    filtered = [(l, v, c) for l, v, c in zip(labels, values, c_vals) if v > 0]
+    if not filtered:
+        filtered = [("No Data", 1, "#BDC3C7")]
+
+    labels_f, values_f, colors_f = zip(*filtered)
+
+    fig, ax = plt.subplots(figsize=(4, 3.5), facecolor="#F5F6FA")
+    ax.set_facecolor("#F5F6FA")
+    wedges, texts, autotexts = ax.pie(
+        values_f,
+        labels=labels_f,
+        colors=colors_f,
+        autopct="%1.1f%%",
+        startangle=140,
+        pctdistance=0.75,
+        wedgeprops={"edgecolor": "white", "linewidth": 1.5}
+    )
+    for t in autotexts:
+        t.set_fontsize(8)
+        t.set_color("white")
+        t.set_fontweight("bold")
+    ax.set_title("Severity Distribution", fontsize=11, fontweight="bold", pad=10)
+    fig.tight_layout()
+    return _fig_to_image(fig, 200, 180)
+
+
+def chart_cvss_heatmap(top_agents: list) -> Image:
+    """CVSS score heatmap per agent."""
+    agents  = [a["agent_name"][:18] for a in top_agents[:15]]
+    scores  = [a.get("max_cvss") or a.get("avg_cvss") or 0 for a in top_agents[:15]]
+
+    fig, ax = plt.subplots(figsize=(10, 2.5), facecolor="#F5F6FA")
+    ax.set_facecolor("#F5F6FA")
+
+    data = np.array(scores).reshape(1, -1)
+    im   = ax.imshow(data, cmap="RdYlGn_r", aspect="auto", vmin=0, vmax=10)
+
+    ax.set_xticks(range(len(agents)))
+    ax.set_xticklabels(agents, rotation=35, ha="right", fontsize=8)
+    ax.set_yticks([])
+    ax.set_title("Max CVSS Score Heatmap (Top Agents)", fontsize=11, fontweight="bold", pad=8)
+
+    for i, score in enumerate(scores):
+        ax.text(i, 0, f"{score:.1f}" if score else "N/A",
+                ha="center", va="center", fontsize=8,
+                color="white" if score > 6 else "black", fontweight="bold")
+
+    plt.colorbar(im, ax=ax, orientation="horizontal", pad=0.3, fraction=0.08, label="CVSS Score")
+    fig.tight_layout()
+    return _fig_to_image(fig, 480, 160)
+
+
+def chart_agents_by_severity_stacked(all_agents_grouped: dict) -> Image:
+    """Stacked bar showing all agents grouped by severity."""
+    severities = ["Critical", "High", "Medium"]
+    counts     = [len(all_agents_grouped.get(s, [])) for s in severities]
+    colors_bar = ["#C0392B", "#E67E22", "#F1C40F"]
+
+    fig, ax = plt.subplots(figsize=(6, 3), facecolor="#F5F6FA")
+    ax.set_facecolor("#F5F6FA")
+
+    bars = ax.bar(severities, counts, color=colors_bar, width=0.5, zorder=3,
+                  edgecolor="white", linewidth=1.5)
+    ax.set_ylabel("Number of Agents", fontsize=9)
+    ax.set_title("Agent Count by Highest Vulnerability Severity", fontsize=11,
+                 fontweight="bold", pad=10)
+    ax.grid(axis="y", alpha=0.4, zorder=0)
+    ax.spines[["top","right"]].set_visible(False)
+
+    for bar in bars:
+        h = bar.get_height()
+        if h > 0:
+            ax.text(bar.get_x() + bar.get_width()/2, h + 0.2,
+                    str(int(h)), ha="center", va="bottom",
+                    fontsize=10, fontweight="bold")
+    fig.tight_layout()
+    return _fig_to_image(fig, 300, 180)
+
+
+def chart_ip_confidence(malicious: dict) -> Image:
+    high   = len(malicious.get("high_confidence",   []))
+    medium = len(malicious.get("medium_confidence", []))
+    total  = high + medium
+
+    if total == 0:
+        return None
+
+    fig, ax = plt.subplots(figsize=(4, 3), facecolor="#F5F6FA")
+    ax.set_facecolor("#F5F6FA")
+    ax.bar(["High Confidence", "Medium Confidence"],
+           [high, medium],
+           color=["#C0392B", "#E67E22"],
+           width=0.4, zorder=3,
+           edgecolor="white", linewidth=1.5)
+    ax.set_title("Malicious IP by Confidence Level", fontsize=10, fontweight="bold")
+    ax.grid(axis="y", alpha=0.4, zorder=0)
+    ax.spines[["top","right"]].set_visible(False)
+    for i, v in enumerate([high, medium]):
+        if v > 0:
+            ax.text(i, v + 0.05, str(v), ha="center", va="bottom",
+                    fontsize=11, fontweight="bold")
+    fig.tight_layout()
+    return _fig_to_image(fig, 220, 160)
+
+
+# TABLE HELPERS
+
+def _base_table_style(header_color=C_ACCENT):
+    return TableStyle([
+        ("BACKGROUND",  (0, 0), (-1, 0),  header_color),
+        ("TEXTCOLOR",   (0, 0), (-1, 0),  colors.white),
+        ("FONTNAME",    (0, 0), (-1, 0),  "Helvetica-Bold"),
+        ("FONTSIZE",    (0, 0), (-1, 0),  8),
+        ("BOTTOMPADDING",(0,0), (-1, 0),  6),
+        ("TOPPADDING",  (0, 0), (-1, 0),  6),
+        ("FONTNAME",    (0, 1), (-1, -1), "Helvetica"),
+        ("FONTSIZE",    (0, 1), (-1, -1), 7.5),
+        ("TOPPADDING",  (0, 1), (-1, -1), 4),
+        ("BOTTOMPADDING",(0,1), (-1, -1), 4),
+        ("ROWBACKGROUNDS",(0,1),(-1,-1),  [colors.white, C_LIGHT]),
+        ("GRID",        (0, 0), (-1, -1), 0.3, C_BORDER),
+        ("VALIGN",      (0, 0), (-1, -1), "MIDDLE"),
+        ("WORDWRAP",    (0, 0), (-1, -1), True),
+    ])
+
+
+def sev_color_cell(sev: str) -> colors.Color:
+    return SEV_COLOR_MAP.get(sev, C_INFO)
+
+
+# PAGE TEMPLATE  (header / footer on every page)
+
+class ReportCanvas(rl_canvas.Canvas):
+    def __init__(self, *args, report_title="Wazuh Security Report",
+                 generated_at="", **kwargs):
+        super().__init__(*args, **kwargs)
+        self._saved_page_states = []
+        self.report_title   = report_title
+        self.generated_at   = generated_at
+
+    def showPage(self):
+        self._saved_page_states.append(dict(self.__dict__))
+        self._startPage()
+
+    def save(self):
+        total = len(self._saved_page_states)
+        for state in self._saved_page_states:
+            self.__dict__.update(state)
+            self._draw_page_decorations(total)
+            rl_canvas.Canvas.showPage(self)
+        rl_canvas.Canvas.save(self)
+
+    def _draw_page_decorations(self, total_pages):
+        page_num = self._pageNumber
+        w, h     = A4
+
+        # Skip cover page decoration
+        if page_num == 1:
+            return
+
+        # Header bar
+        self.setFillColor(C_ACCENT)
+        self.rect(0, h - 22*mm, w, 8*mm, fill=1, stroke=0)
+        self.setFillColor(colors.white)
+        self.setFont("Helvetica-Bold", 8)
+        self.drawString(15*mm, h - 17*mm, self.report_title)
+        self.setFont("Helvetica", 7)
+        self.drawRightString(w - 15*mm, h - 17*mm, self.generated_at)
+
+        # Footer
+        self.setFillColor(C_LIGHT)
+        self.rect(0, 0, w, 12*mm, fill=1, stroke=0)
+        self.setFillColor(C_MUTED)
+        self.setFont("Helvetica", 7)
+        self.drawString(15*mm, 4*mm, "CONFIDENTIAL — Internal Security Report")
+        self.drawRightString(w - 15*mm, 4*mm,
+                             f"Page {page_num} of {total_pages}")
+
+        # Thin accent line at footer top
+        self.setStrokeColor(C_ACCENT)
+        self.setLineWidth(0.5)
+        self.line(0, 12*mm, w, 12*mm)
+
+
+def _make_canvas_factory(report_title, generated_at):
+    def factory(*args, **kwargs):
+        return ReportCanvas(*args,
+                            report_title=report_title,
+                            generated_at=generated_at,
+                            **kwargs)
+    return factory
+
+
+# SECTION BUILDERS
+
+def _section_header(story, styles, number, title, subtitle=""):
+    story.append(Spacer(1, 6))
+    story.append(ColorBar(A4[0] - 60*mm, 3, C_ACCENT))
+    story.append(Spacer(1, 4))
+    story.append(Paragraph(f"{number}. {title}", styles["h1"]))
+    if subtitle:
+        story.append(Paragraph(subtitle, styles["muted"]))
+    story.append(Spacer(1, 4))
+
+
+def build_cover(story, styles, canonical):
+    meta    = canonical.get("meta", {})
+    period  = meta.get("period", {})
+    summary = canonical.get("vulnerability_summary", {})
+    w, h    = A4
+
+    # Dark background block (simulated with table)
+    cover_data = [[""]]
+    cover_tbl  = Table(cover_data, colWidths=[w - 40*mm], rowHeights=[60*mm])
+    cover_tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,-1), C_DARK),
+        ("TOPPADDING", (0,0), (-1,-1), 0),
+        ("BOTTOMPADDING",(0,0),(-1,-1),0),
+    ]))
+    story.append(Spacer(1, 20*mm))
+    story.append(cover_tbl)
+
+    # Title overlaid via paragraphs after the block
+    story.append(Spacer(1, -58*mm))
+    story.append(Paragraph(meta.get("report_name", "Wazuh Security Report"),
+                            styles["cover_title"]))
+    story.append(Spacer(1, 4*mm))
+    story.append(Paragraph(
+        f"Period: {period.get('start','')[:10]}  →  {period.get('end','')[:10]}",
+        styles["cover_sub"]))
+    story.append(Spacer(1, 2*mm))
+    story.append(Paragraph(
+        f"Generated: {meta.get('generated_at','')[:19].replace('T',' ')}  |  Timezone: {meta.get('timezone','')}",
+        styles["cover_meta"]))
+    story.append(Spacer(1, 20*mm))
+
+    # KPI row
+    kpi_items = [
+        (str(summary.get("total_agents_affected", 0)), "Affected Agents"),
+        (str(summary.get("critical_count", 0)),        "Critical CVEs"),
+        (str(summary.get("high_count", 0)),            "High CVEs"),
+        (str(summary.get("total_findings", 0)),        "Total Findings"),
+    ]
+    kpi_cells = []
+    for val, lbl in kpi_items:
+        kpi_cells.append([
+            Paragraph(val, styles["kpi_value"]),
+            Paragraph(lbl, styles["kpi_label"]),
+        ])
+    kpi_table = Table(
+        [[c[0] for c in kpi_cells], [c[1] for c in kpi_cells]],
+        colWidths=[(w - 40*mm) / 4] * 4
+    )
+    kpi_table.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,-1), C_LIGHT),
+        ("BOX",        (0,0), (-1,-1), 0.5, C_BORDER),
+        ("INNERGRID",  (0,0), (-1,-1), 0.3, C_BORDER),
+        ("TOPPADDING", (0,0), (-1,-1), 10),
+        ("BOTTOMPADDING",(0,0),(-1,-1),10),
+        ("ALIGN",      (0,0), (-1,-1), "CENTER"),
+    ]))
+    story.append(kpi_table)
+    story.append(Spacer(1, 10*mm))
+
+    # Dojo + product info
+    dojo  = meta.get("dojo", {})
+    info  = f"Product: <b>{dojo.get('product','')}</b>  |  Engagement: <b>{dojo.get('engagement','')}</b>"
+    story.append(Paragraph(info, ParagraphStyle("info", fontSize=9,
+                 textColor=C_MUTED, alignment=TA_CENTER)))
+    story.append(PageBreak())
+
+
+def build_toc(story, styles):
+    sections = [
+        ("1", "Executive Summary"),
+        ("2", "Vulnerability Overview — All Agents"),
+        ("3", "Top 10 Agents — Critical & High CVE Detail"),
+        ("4", "CVSS Score Analysis"),
+        ("5", "DDoS / Incident Alerts"),
+        ("6", "Validated Malicious IPs"),
+        ("7", "DefectDojo Import Summary"),
+    ]
+    story.append(Paragraph("Table of Contents", styles["h1"]))
+    story.append(ColorBar(A4[0] - 60*mm, 2, C_ACCENT))
+    story.append(Spacer(1, 8))
+    for num, title in sections:
+        dot_line = "." * 80
+        row = f"<b>{num}.</b>  {title}"
+        story.append(Paragraph(row, styles["toc"]))
+    story.append(PageBreak())
+
+
+def build_executive_summary(story, styles, canonical):
+    _section_header(story, styles, 1, "Executive Summary",
+                    "High-level overview of the security posture for this reporting period.")
+
+    meta    = canonical.get("meta", {})
+    summary = canonical.get("vulnerability_summary", {})
+    malicious = canonical.get("malicious_ip_summary", {})
+    dojo    = canonical.get("dojo_summary", {})
+    period  = meta.get("period", {})
+
+    # Period info box
+    period_data = [
+        ["Report Period",   f"{period.get('start','')[:10]} to {period.get('end','')[:10]}"],
+        ["Timezone",        meta.get("timezone","")],
+        ["Generated At",    meta.get("generated_at","")[:19].replace("T"," ")],
+        ["Scope",           f"Top {meta.get('top_n', 10)} agents analyzed in detail"],
+    ]
+    period_tbl = Table(period_data, colWidths=[60*mm, 110*mm])
+    period_tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (0,-1), C_ACCENT),
+        ("TEXTCOLOR",  (0,0), (0,-1), colors.white),
+        ("FONTNAME",   (0,0), (0,-1), "Helvetica-Bold"),
+        ("FONTSIZE",   (0,0), (-1,-1), 8),
+        ("TOPPADDING", (0,0), (-1,-1), 5),
+        ("BOTTOMPADDING",(0,0),(-1,-1), 5),
+        ("GRID",       (0,0), (-1,-1), 0.3, C_BORDER),
+        ("BACKGROUND", (1,0), (1,-1), C_LIGHT),
+    ]))
+    story.append(period_tbl)
+    story.append(Spacer(1, 10))
+
+    # Key findings summary
+    story.append(Paragraph("Key Findings", styles["h2"]))
+    story.append(Spacer(1, 4))
+
+    findings_data = [
+        ["Metric", "Value", "Status"],
+        ["Total Agents Affected",
+         str(summary.get("total_agents_affected", 0)),
+         "⚠ Review Required"],
+        ["Critical CVE Count",
+         str(summary.get("critical_count", 0)),
+         "✗ Immediate Action" if summary.get("critical_count",0) > 0 else "✓ Clear"],
+        ["High CVE Count",
+         str(summary.get("high_count", 0)),
+         "⚠ Action Required" if summary.get("high_count",0) > 0 else "✓ Clear"],
+        ["Medium CVE Count",
+         str(summary.get("medium_count", 0)),
+         "→ Monitor"],
+        ["Total Findings (Critical+High)",
+         str(summary.get("total_findings", 0)),
+         "—"],
+        ["High Confidence Malicious IPs",
+         str(len(malicious.get("high_confidence",[]))),
+         "✗ Block Candidates" if len(malicious.get("high_confidence",[])) > 0 else "✓ Clear"],
+        ["Medium Confidence IPs (Watchlist)",
+         str(len(malicious.get("medium_confidence",[]))),
+         "⚠ Monitor"],
+        ["DefectDojo Import Status",
+         dojo.get("import_status","pending").upper(),
+         "✓ Imported" if dojo.get("import_status") == "success" else "⚠ Pending"],
+    ]
+
+    tbl = Table(findings_data, colWidths=[85*mm, 40*mm, 60*mm])
+    style = _base_table_style(C_ACCENT2)
+    # Color critical row
+    for i, row in enumerate(findings_data[1:], 1):
+        if "Critical" in row[0] and int(row[1] or 0) > 0:
+            style.add("BACKGROUND", (0,i), (-1,i), colors.HexColor("#FDEDEC"))
+        elif "High" in row[0] and int(row[1] or 0) > 0:
+            style.add("BACKGROUND", (0,i), (-1,i), colors.HexColor("#FEF9E7"))
+    tbl.setStyle(style)
+    story.append(tbl)
+    story.append(Spacer(1, 10))
+
+    # Charts row: pie + bar
+    story.append(Paragraph("Severity Distribution & Top Agents", styles["h2"]))
+    story.append(Spacer(1, 4))
+
+    top_agents = canonical.get("top_agents", [])
+    if top_agents:
+        pie_img = chart_severity_pie(summary)
+        bar_img = chart_top_agents_bar(top_agents)
+
+        chart_tbl = Table([[pie_img, bar_img]],
+                          colWidths=[200, 300])
+        chart_tbl.setStyle(TableStyle([
+            ("VALIGN",  (0,0),(-1,-1),"MIDDLE"),
+            ("ALIGN",   (0,0),(-1,-1),"CENTER"),
+            ("LEFTPADDING",(0,0),(-1,-1),0),
+            ("RIGHTPADDING",(0,0),(-1,-1),0),
+        ]))
+        story.append(chart_tbl)
+
+    story.append(PageBreak())
+
+
+def build_all_agents_section(story, styles, canonical):
+    _section_header(story, styles, 2, "Vulnerability Overview — All Agents",
+                    "All monitored agents grouped by highest vulnerability severity.")
+
+    all_agents  = canonical.get("all_agents_grouped", {})
+    top_agents  = canonical.get("top_agents", [])
+
+    # Chart
+    if all_agents:
+        story.append(chart_agents_by_severity_stacked(all_agents))
+        story.append(Spacer(1, 8))
+
+    severities = ["Critical", "High", "Medium", "Low", "Clean"]
+    for sev in severities:
+        agents_in_group = all_agents.get(sev, [])
+        if not agents_in_group:
+            continue
+
+        sev_color = SEV_COLOR_MAP.get(sev, C_LOW)
+
+        story.append(KeepTogether([
+            Paragraph(f"● {sev} — {len(agents_in_group)} agents",
+                      ParagraphStyle(f"sev_{sev}",
+                          fontSize=11, fontName="Helvetica-Bold",
+                          textColor=sev_color, spaceBefore=10, spaceAfter=4)),
+            ColorBar(A4[0] - 60*mm, 2, sev_color),
+            Spacer(1, 4),
+        ]))
+
+        # Table of agents
+        header = ["#", "Agent ID", "Agent Name", "OS", "Critical", "High", "Medium", "Max CVSS"]
+        rows   = [header]
+        for idx, a in enumerate(agents_in_group, 1):
+            rows.append([
+                str(idx),
+                str(a.get("agent_id", "")),
+                str(a.get("agent_name", "")),
+                str(a.get("os", ""))[:35],
+                str(a.get("critical_cve_count", 0)),
+                str(a.get("high_cve_count", 0)),
+                str(a.get("medium_cve_count", 0)),
+                str(a.get("max_cvss", "N/A")),
+            ])
+
+        col_w = [10*mm, 18*mm, 45*mm, 50*mm, 16*mm, 16*mm, 16*mm, 18*mm]
+        tbl   = Table(rows, colWidths=col_w, repeatRows=1)
+        ts    = _base_table_style(sev_color)
+        # Highlight critical count cells
+        for i in range(1, len(rows)):
+            if rows[i][4] not in ("0", ""):
+                ts.add("TEXTCOLOR", (4,i), (4,i), C_CRITICAL)
+                ts.add("FONTNAME",  (4,i), (4,i), "Helvetica-Bold")
+        tbl.setStyle(ts)
+        story.append(tbl)
+        story.append(Spacer(1, 8))
+
+    story.append(PageBreak())
+
+
+def build_top_agents_detail(story, styles, canonical):
+    _section_header(story, styles, 3, "Top 10 Agents — CVE Detail",
+                    "Detailed CVE breakdown for the most vulnerable agents.")
+
+    top_agents = canonical.get("top_agents", [])
+    agent_cves = canonical.get("agent_cves", {})
+
+    # CVSS heatmap
+    if top_agents:
+        story.append(Paragraph("CVSS Score Heatmap", styles["h2"]))
+        story.append(chart_cvss_heatmap(top_agents))
+        story.append(Spacer(1, 10))
+
+    for rank, agent in enumerate(top_agents, 1):
+        name = agent.get("agent_name", "")
+        cves = agent_cves.get(name, [])
+
+        agent_block = [
+            Paragraph(
+                f"#{rank}  {name}",
+                ParagraphStyle(f"agent_{rank}", fontSize=11,
+                    fontName="Helvetica-Bold", textColor=C_ACCENT,
+                    spaceBefore=12, spaceAfter=2)
+            ),
+            Paragraph(
+                f"Agent ID: {agent.get('agent_id','')}  |  "
+                f"OS: {agent.get('os','N/A')}  |  "
+                f"Critical: {agent.get('critical_cve_count',0)}  |  "
+                f"High: {agent.get('high_cve_count',0)}  |  "
+                f"Max CVSS: {agent.get('max_cvss','N/A')}  |  "
+                f"Avg CVSS: {agent.get('avg_cvss','N/A')}",
+                styles["muted"]
+            ),
+            Spacer(1, 4),
+        ]
+        story.append(KeepTogether(agent_block))
+
+        if not cves:
+            story.append(Paragraph("No CVE detail available.", styles["muted"]))
+            continue
+
+        header = ["CVE ID", "Sev", "CVSS", "Package", "Version", "Description"]
+        rows   = [header]
+        for cve in cves:
+            desc = str(cve.get("description") or "")[:120]
+            if len(str(cve.get("description") or "")) > 120:
+                desc += "…"
+            rows.append([
+                str(cve.get("cve_id", "")),
+                str(cve.get("severity", "")),
+                str(cve.get("cvss", "N/A")),
+                str(cve.get("package_name", ""))[:22],
+                str(cve.get("package_version", ""))[:15],
+                Paragraph(desc, styles["body_small"]),
+            ])
+
+        col_w = [28*mm, 16*mm, 14*mm, 28*mm, 20*mm, 65*mm]
+        tbl   = Table(rows, colWidths=col_w, repeatRows=1)
+        ts    = _base_table_style(C_ACCENT2)
+
+        for i, row in enumerate(rows[1:], 1):
+            sev = row[1]
+            c   = SEV_COLOR_MAP.get(sev, C_INFO)
+            ts.add("TEXTCOLOR", (1,i), (1,i), c)
+            ts.add("FONTNAME",  (1,i), (1,i), "Helvetica-Bold")
+            if sev == "Critical":
+                ts.add("BACKGROUND", (0,i), (-1,i), colors.HexColor("#FDEDEC"))
+
+        tbl.setStyle(ts)
+        story.append(tbl)
+        story.append(Spacer(1, 6))
+
+    story.append(PageBreak())
+
+
+def build_cvss_analysis(story, styles, canonical):
+    _section_header(story, styles, 4, "CVSS Score Analysis",
+                    "Distribution and ranking of CVSS scores across all agents.")
+
+    top_agents = canonical.get("top_agents", [])
+    if not top_agents:
+        story.append(Paragraph("No CVSS data available.", styles["body"]))
+        story.append(PageBreak())
+        return
+
+    # CVSS ranking table
+    story.append(Paragraph("Agent CVSS Ranking", styles["h2"]))
+    header = ["Rank", "Agent Name", "Max CVSS", "Avg CVSS", "Risk Level"]
+    rows   = [header]
+
+    for i, a in enumerate(top_agents, 1):
+        max_c = a.get("max_cvss")
+        avg_c = a.get("avg_cvss")
+
+        if max_c and float(max_c) >= 9.0:
+            risk = "CRITICAL"
+        elif max_c and float(max_c) >= 7.0:
+            risk = "HIGH"
+        elif max_c and float(max_c) >= 4.0:
+            risk = "MEDIUM"
+        else:
+            risk = "LOW"
+
+        rows.append([
+            str(i),
+            str(a.get("agent_name", "")),
+            str(max_c or "N/A"),
+            str(avg_c or "N/A"),
+            risk,
+        ])
+
+    col_w = [15*mm, 65*mm, 30*mm, 30*mm, 30*mm]
+    tbl   = Table(rows, colWidths=col_w, repeatRows=1)
+    ts    = _base_table_style(C_ACCENT)
+    for i, row in enumerate(rows[1:], 1):
+        risk = row[4]
+        c    = {"CRITICAL": C_CRITICAL, "HIGH": C_HIGH,
+                "MEDIUM": C_MEDIUM, "LOW": C_LOW}.get(risk, C_INFO)
+        ts.add("TEXTCOLOR", (4,i), (4,i), c)
+        ts.add("FONTNAME",  (4,i), (4,i), "Helvetica-Bold")
+    tbl.setStyle(ts)
+    story.append(tbl)
+    story.append(PageBreak())
+
+
+def build_ddos_section(story, styles, canonical):
+    _section_header(story, styles, 5, "DDoS / Incident Alerts",
+                    "Network attack alerts detected during the reporting period.")
+
+    malicious = canonical.get("malicious_ip_summary", {})
+    candidates = malicious.get("candidate_ips", [])
+
+    if not candidates:
+        story.append(Paragraph(
+            "No DDoS/flood alerts found for the selected rule groups in this period.",
+            styles["body"]))
+        story.append(PageBreak())
+        return
+
+    story.append(Paragraph(
+        f"Total candidate source IPs detected: <b>{len(candidates)}</b>",
+        styles["body"]))
+    story.append(Spacer(1, 8))
+
+    header = ["#", "Source IP", "Alert Count", "TI Status"]
+    rows   = [header]
+    for i, item in enumerate(candidates, 1):
+        conf = item.get("confidence", "Pending")
+        rows.append([
+            str(i),
+            str(item.get("ip", "")),
+            str(item.get("alert_count", 0)),
+            conf,
+        ])
+
+    col_w = [12*mm, 50*mm, 35*mm, 40*mm]
+    tbl   = Table(rows, colWidths=col_w, repeatRows=1)
+    ts    = _base_table_style(C_ACCENT2)
+    for i, row in enumerate(rows[1:], 1):
+        conf = row[3]
+        c    = {"High": C_CRITICAL, "Medium": C_HIGH, "Low": C_MEDIUM,
+                "Ignore": C_LOW, "Pending": C_INFO}.get(conf, C_INFO)
+        ts.add("TEXTCOLOR", (3,i), (3,i), c)
+        ts.add("FONTNAME",  (3,i), (3,i), "Helvetica-Bold")
+    tbl.setStyle(ts)
+    story.append(tbl)
+    story.append(PageBreak())
+
+
+def build_malicious_ip_section(story, styles, canonical):
+    _section_header(story, styles, 6, "Validated Malicious IPs",
+                    "IPs validated against VirusTotal, AlienVault OTX, and AbuseIPDB.")
+
+    malicious  = canonical.get("malicious_ip_summary", {})
+    high_conf  = malicious.get("high_confidence",   [])
+    med_conf   = malicious.get("medium_confidence", [])
+
+    # Chart
+    chart = chart_ip_confidence(malicious)
+    if chart:
+        story.append(chart)
+        story.append(Spacer(1, 8))
+
+    # High confidence
+    story.append(Paragraph(
+        f"High Confidence Malicious IPs ({len(high_conf)})",
+        styles["h2"]))
+    story.append(Paragraph(
+        "Confirmed malicious — candidate for blocklist review.",
+        styles["muted"]))
+    story.append(Spacer(1, 4))
+
+    if high_conf:
+        header = ["IP Address", "Alerts", "VT Malicious", "OTX Pulses",
+                  "AbuseIPDB Score", "Total Reports", "Recommendation"]
+        rows   = [header]
+        for item in high_conf:
+            vt    = item.get("virustotal", {})
+            otx   = item.get("otx", {})
+            abuse = item.get("abuseipdb", {})
+            rows.append([
+                str(item.get("ip","")),
+                str(item.get("alert_count", 0)),
+                str(vt.get("malicious", 0)),
+                str(otx.get("pulse_count", 0)),
+                str(abuse.get("abuseConfidenceScore", 0)),
+                str(abuse.get("totalReports", 0)),
+                "Block Candidate",
+            ])
+        col_w = [32*mm, 15*mm, 22*mm, 20*mm, 25*mm, 20*mm, 32*mm]
+        tbl   = Table(rows, colWidths=col_w, repeatRows=1)
+        ts    = _base_table_style(C_CRITICAL)
+        for i in range(1, len(rows)):
+            ts.add("BACKGROUND", (0,i), (-1,i), colors.HexColor("#FDEDEC"))
+        tbl.setStyle(ts)
+        story.append(tbl)
+    else:
+        story.append(Paragraph("No high-confidence malicious IPs found.", styles["body"]))
+
+    story.append(Spacer(1, 12))
+
+    # Medium confidence
+    story.append(Paragraph(
+        f"Suspicious IP Watchlist — Medium Confidence ({len(med_conf)})",
+        styles["h2"]))
+    story.append(Paragraph(
+        "Suspicious activity detected — monitor and review.",
+        styles["muted"]))
+    story.append(Spacer(1, 4))
+
+    if med_conf:
+        header = ["IP Address", "Alerts", "VT Malicious", "OTX Pulses",
+                  "AbuseIPDB Score", "Recommendation"]
+        rows   = [header]
+        for item in med_conf:
+            vt    = item.get("virustotal", {})
+            otx   = item.get("otx", {})
+            abuse = item.get("abuseipdb", {})
+            rows.append([
+                str(item.get("ip","")),
+                str(item.get("alert_count", 0)),
+                str(vt.get("malicious", 0)),
+                str(otx.get("pulse_count", 0)),
+                str(abuse.get("abuseConfidenceScore", 0)),
+                "Monitor & Review",
+            ])
+        col_w = [35*mm, 18*mm, 25*mm, 22*mm, 28*mm, 38*mm]
+        tbl   = Table(rows, colWidths=col_w, repeatRows=1)
+        ts    = _base_table_style(C_HIGH)
+        for i in range(1, len(rows)):
+            ts.add("BACKGROUND", (0,i), (-1,i), colors.HexColor("#FEF9E7"))
+        tbl.setStyle(ts)
+        story.append(tbl)
+    else:
+        story.append(Paragraph("No medium-confidence IPs found.", styles["body"]))
+
+    story.append(PageBreak())
+
+
+def build_dojo_summary(story, styles, canonical):
+    _section_header(story, styles, 7, "DefectDojo Import Summary",
+                    "Summary of findings imported into DefectDojo vulnerability management.")
+
+    dojo  = canonical.get("dojo_summary", {})
+    meta  = canonical.get("meta", {})
+    dojo_meta = meta.get("dojo", {})
+
+    status_color = C_LOW if dojo.get("import_status") == "success" else C_HIGH
+
+    data = [
+        ["Field", "Value"],
+        ["Product",                     dojo_meta.get("product","")],
+        ["Engagement",                  dojo_meta.get("engagement","")],
+        ["Import Status",               dojo.get("import_status","pending").upper()],
+        ["Total Findings Planned",      str(dojo.get("planned_total_findings",0))],
+        ["Vulnerability Findings",      str(dojo.get("planned_vulnerability_findings",0))],
+        ["Malicious IP Findings",       str(dojo.get("planned_malicious_ip_findings",0))],
+        ["Skipped (Medium IP)",         str(dojo.get("skipped_medium_ip_findings",0))],
+    ]
+
+    col_w = [70*mm, 100*mm]
+    tbl   = Table(data, colWidths=col_w)
+    ts    = _base_table_style(C_ACCENT)
+    ts.add("TEXTCOLOR", (1,3), (1,3), status_color)
+    ts.add("FONTNAME",  (1,3), (1,3), "Helvetica-Bold")
+    tbl.setStyle(ts)
+    story.append(tbl)
+    story.append(Spacer(1, 8))
+
+    story.append(Paragraph(
+        "Note: Medium confidence IPs are included in the report for monitoring "
+        "but excluded from DefectDojo import to avoid alert fatigue.",
+        styles["muted"]))
+
+
+# MAIN PDF GENERATOR
+
+def generate_pdf_report(canonical: dict, pdf_path: Path):
+    styles = make_styles()
+    story  = []
+
+    meta         = canonical.get("meta", {})
+    report_title = meta.get("report_name", "Wazuh Security Report")
+    generated_at = meta.get("generated_at","")[:19].replace("T"," ")
+
+    doc = SimpleDocTemplate(
+        str(pdf_path),
+        pagesize=A4,
+        leftMargin=20*mm,
+        rightMargin=20*mm,
+        topMargin=28*mm,
+        bottomMargin=18*mm,
+        title=report_title,
+        author="Wazuh Report Worker",
+        subject="Security Vulnerability Report",
+    )
+
+    build_cover(story, styles, canonical)
+    build_toc(story, styles)
+    build_executive_summary(story, styles, canonical)
+    build_all_agents_section(story, styles, canonical)
+    build_top_agents_detail(story, styles, canonical)
+    build_cvss_analysis(story, styles, canonical)
+    build_ddos_section(story, styles, canonical)
+    build_malicious_ip_section(story, styles, canonical)
+    build_dojo_summary(story, styles, canonical)
+
+    canvas_factory = _make_canvas_factory(report_title, generated_at)
+    doc.build(story, canvasmaker=canvas_factory)
+
+
+# DATA FETCHING  (unchanged from original, condensed)
+
+def dig(obj, path, default=None):
+    cur = obj
+    for p in path:
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(p)
+        if cur is None:
+            return default
+    return cur
+
+
+def to_float(val):
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except Exception:
+        return None
+
+
+def extract_cvss(src: dict):
+    candidates = [
+        ["vulnerability","score","base"],
+        ["vulnerability","cvss","base_score"],
+        ["vulnerability","cvss","score"],
+        ["vulnerability","cvss3","base_score"],
+        ["vulnerability","score"],
+    ]
+    for path in candidates:
+        val = dig(src, path)
+        f   = to_float(val)
+        if f is not None and f >= 0:
+            return round(f, 2)
+        if isinstance(val, dict):
+            for k in ["base","score","base_score","value"]:
+                f = to_float(val.get(k))
+                if f is not None and f >= 0:
+                    return round(f, 2)
+    return None
+
+
+def normalize_references(ref_value):
+    if ref_value is None:
+        return []
+    parts = []
+    if isinstance(ref_value, list):
+        for item in ref_value:
+            if item:
+                parts.extend([x.strip() for x in str(item).split(",") if x.strip()])
+    elif isinstance(ref_value, str):
+        parts = [x.strip() for x in ref_value.split(",") if x.strip()]
+    seen, cleaned = set(), []
+    for p in parts:
+        if p not in seen:
+            seen.add(p)
+            cleaned.append(p)
+    return cleaned
+
+
+def resolve_period(payload: dict) -> dict:
+    date_mode = payload.get("date_mode","preset")
+    timezone  = payload.get("timezone", settings.DEFAULT_TIMEZONE)
+    today     = date.today()
+
+    if date_mode == "custom":
+        return {
+            "mode": "custom",
+            "start": f"{payload['start_date']}T00:00:00",
+            "end":   f"{payload['end_date']}T23:59:59",
+            "timezone": timezone
+        }
+
+    preset = payload.get("preset","last_month")
+    if preset == "last_7_days":
+        s, e = today - timedelta(days=7), today
+    elif preset == "last_30_days":
+        s, e = today - timedelta(days=30), today
+    elif preset == "this_month":
+        s, e = today.replace(day=1), today
+    else:  # last_month
+        first = today.replace(day=1)
+        e     = first - timedelta(days=1)
+        s     = e.replace(day=1)
+
+    return {"mode":"preset","preset":preset,
+            "start":f"{s.isoformat()}T00:00:00",
+            "end":  f"{e.isoformat()}T23:59:59",
+            "timezone":timezone}
+
+
+def _session():
+    s = requests.Session()
+    s.auth = HTTPBasicAuth(settings.WAZUH_INDEXER_USER, settings.WAZUH_INDEXER_PASS)
+    return s
+
+
+def indexer_post(path: str, body: dict) -> dict:
+    url = f"{settings.WAZUH_INDEXER_URL.rstrip('/')}/{path.lstrip('/')}"
+    r   = _session().post(url, json=body, verify=settings.WAZUH_VERIFY_SSL, timeout=120)
+    if not r.ok:
+        raise Exception(f"Indexer error {r.status_code}: {r.text[:300]}")
+    return r.json()
+
+
+def fetch_vulnerability_summary() -> dict:
+    body = {
+        "size": 0,
+        "aggs": {
+            "sev": {"terms": {"field":"vulnerability.severity","size":10}},
+            "affected_agents": {"cardinality": {"field":"agent.name"}}
+        }
+    }
+    data    = indexer_post("/wazuh-states-vulnerabilities*/_search", body)
+    counts  = {b["key"]: b["doc_count"]
+               for b in data.get("aggregations",{}).get("sev",{}).get("buckets",[])}
+    return {
+        "critical_count":         counts.get("Critical", 0),
+        "high_count":             counts.get("High", 0),
+        "medium_count":           counts.get("Medium", 0),
+        "low_count":              counts.get("Low", 0),
+        "total_findings":         counts.get("Critical",0) + counts.get("High",0),
+        "total_agents_affected":  data.get("aggregations",{})
+                                     .get("affected_agents",{}).get("value",0),
+    }
+
+
+def fetch_all_agents_with_severity(top_n: int = 200) -> dict:
+    """
+    Fetch all agents and group them by their highest severity.
+    Returns dict: {"Critical": [...], "High": [...], "Medium": [...], "Low": [...], "Clean": [...]}
+    """
+    body = {
+        "size": 0,
+        "aggs": {
+            "all_agents": {
+                "terms": {"field":"agent.name","size": top_n},
+                "aggs": {
+                    "sevs": {"terms": {"field":"vulnerability.severity","size":5}},
+                    "sample": {"top_hits": {
+                        "size": 1,
+                        "_source": ["agent.id","agent.name","host.os.full"]
+                    }},
+                    "max_score": {"max": {"field":"vulnerability.score.base"}},
+                    "avg_score": {"avg": {"field":"vulnerability.score.base"}},
+                }
+            }
+        }
+    }
+    data    = indexer_post("/wazuh-states-vulnerabilities*/_search", body)
+    buckets = data.get("aggregations",{}).get("all_agents",{}).get("buckets",[])
+
+    grouped = {"Critical":[], "High":[], "Medium":[], "Low":[], "Clean":[]}
+
+    for b in buckets:
+        src       = b["sample"]["hits"]["hits"][0]["_source"]
+        sev_counts = {s["key"]: s["doc_count"]
+                      for s in b.get("sevs",{}).get("buckets",[])}
+        max_score = b.get("max_score",{}).get("value")
+        avg_score = b.get("avg_score",{}).get("value")
+
+        agent = {
+            "agent_id":           src.get("agent",{}).get("id"),
+            "agent_name":         src.get("agent",{}).get("name") or b["key"],
+            "os":                 src.get("host",{}).get("os",{}).get("full",""),
+            "critical_cve_count": sev_counts.get("Critical",0),
+            "high_cve_count":     sev_counts.get("High",0),
+            "medium_cve_count":   sev_counts.get("Medium",0),
+            "low_cve_count":      sev_counts.get("Low",0),
+            "max_cvss":           round(max_score,2) if max_score and max_score > 0 else None,
+            "avg_cvss":           round(avg_score,2) if avg_score and avg_score > 0 else None,
+        }
+
+        # Assign to highest severity group
+        if agent["critical_cve_count"] > 0:
+            grouped["Critical"].append(agent)
+        elif agent["high_cve_count"] > 0:
+            grouped["High"].append(agent)
+        elif agent["medium_cve_count"] > 0:
+            grouped["Medium"].append(agent)
+        elif agent["low_cve_count"] > 0:
+            grouped["Low"].append(agent)
+        else:
+            grouped["Clean"].append(agent)
+
+    # Sort each group by critical count desc, then high count desc
+    for sev in grouped:
+        grouped[sev].sort(
+            key=lambda x: (x["critical_cve_count"], x["high_cve_count"],
+                           x.get("max_cvss") or 0),
+            reverse=True
+        )
+
+    return grouped
+
+
+def fetch_top_agents(all_agents_grouped: dict, top_n: int = 10) -> list:
+    """Extract top N from all agents grouped (Critical first, then High)."""
+    combined = (
+        all_agents_grouped.get("Critical", []) +
+        all_agents_grouped.get("High", [])
+    )
+    combined.sort(
+        key=lambda x: (x["critical_cve_count"], x.get("max_cvss") or 0),
+        reverse=True
+    )
+    return combined[:top_n]
+
+
+def fetch_top_cves_for_agent(agent_name: str, top_n: int = 10) -> list:
+    body = {
+        "size": 0,
+        "query": {"bool": {"filter": [
+            {"term": {"agent.name": agent_name}},
+            {"terms": {"vulnerability.severity": ["Critical","High"]}}
+        ]}},
+        "aggs": {
+            "top_cves": {
+                "terms": {"field":"vulnerability.id","size": top_n},
+                "aggs": {"sample": {"top_hits": {
+                    "size": 1,
+                    "_source": [
+                        "vulnerability.id","vulnerability.severity",
+                        "vulnerability.description","vulnerability.reference",
+                        "vulnerability.score","package.name","package.version"
+                    ]
+                }}}
+            }
+        }
+    }
+    data    = indexer_post("/wazuh-states-vulnerabilities*/_search", body)
+    buckets = data.get("aggregations",{}).get("top_cves",{}).get("buckets",[])
+
+    items = []
+    for b in buckets:
+        src  = b["sample"]["hits"]["hits"][0]["_source"]
+        cvss = extract_cvss(src)
+        items.append({
+            "cve_id":          dig(src,["vulnerability","id"]),
+            "severity":        dig(src,["vulnerability","severity"]),
+            "cvss":            cvss,
+            "package_name":    dig(src,["package","name"]),
+            "package_version": dig(src,["package","version"]),
+            "description":     dig(src,["vulnerability","description"]),
+            "references":      normalize_references(dig(src,["vulnerability","reference"])),
+            "resolution":      "Update to vendor-fixed version.",
+            "mitigation":      f"Patch {dig(src,['package','name']) or 'component'}; restrict exposure.",
+        })
+
+    items.sort(key=lambda x: (x.get("cvss") or -1), reverse=True)
+    return items[:top_n]
+
+
+def fetch_alert_candidates(period: dict, top_n: int = 50, groups=None) -> list:
+    if groups is None:
+        groups = ["attack","web","accesslog"]
+    body = {
+        "size": 0,
+        "track_total_hits": False,
+        "query": {"bool": {"filter": [
+            {"range": {"@timestamp": {
+                "gte": period["start"], "lte": period["end"],
+                "format": "strict_date_optional_time||yyyy-MM-dd'T'HH:mm:ss"
+            }}},
+            {"terms": {"rule.groups": groups}},
+            {"exists": {"field": "data.srcip"}}
+        ]}},
+        "aggs": {"top_src_ips": {"terms": {"field":"data.srcip","size": top_n}}}
+    }
+    try:
+        data    = indexer_post("/wazuh-alerts*/_search", body)
+        buckets = data.get("aggregations",{}).get("top_src_ips",{}).get("buckets",[])
+        return [{"ip": b["key"], "alert_count": b["doc_count"],
+                 "confidence": "Pending"} for b in buckets]
+    except Exception as e:
+        print(f"[WARN] fetch_alert_candidates failed: {e}")
+        return []
+
+
+def lookup_virustotal(ip):
+    if not settings.VT_API_KEY:
+        return {"enabled":False,"positive":False,"malicious":0,"suspicious":0}
+    try:
+        r = requests.get(f"https://www.virustotal.com/api/v3/ip_addresses/{ip}",
+                         headers={"x-apikey": settings.VT_API_KEY}, timeout=30)
+        r.raise_for_status()
+        stats = dig(r.json(),["data","attributes","last_analysis_stats"],{}) or {}
+        m, s  = stats.get("malicious",0), stats.get("suspicious",0)
+        return {"enabled":True,"positive":m>0 or s>0,"malicious":m,"suspicious":s}
+    except Exception as e:
+        return {"enabled":True,"positive":False,"error":str(e),"malicious":0,"suspicious":0}
+
+
+def lookup_otx(ip):
+    if not settings.OTX_API_KEY:
+        return {"enabled":False,"positive":False,"pulse_count":0}
+    try:
+        r = requests.get(
+            f"https://otx.alienvault.com/api/v1/indicators/IPv4/{ip}/general",
+            headers={"X-OTX-API-KEY": settings.OTX_API_KEY}, timeout=30)
+        r.raise_for_status()
+        pc = dig(r.json(),["pulse_info","count"],0) or 0
+        return {"enabled":True,"positive":pc>0,"pulse_count":pc}
+    except Exception as e:
+        return {"enabled":True,"positive":False,"error":str(e),"pulse_count":0}
+
+
+def lookup_abuseipdb(ip):
+    if not settings.ABUSEIPDB_API_KEY:
+        return {"enabled":False,"positive":False,"abuseConfidenceScore":0,"totalReports":0}
+    try:
+        r = requests.get("https://api.abuseipdb.com/api/v2/check",
+                         headers={"Key": settings.ABUSEIPDB_API_KEY,"Accept":"application/json"},
+                         params={"ipAddress":ip,"maxAgeInDays":90}, timeout=30)
+        r.raise_for_status()
+        sc = dig(r.json(),["data","abuseConfidenceScore"],0) or 0
+        tr = dig(r.json(),["data","totalReports"],0) or 0
+        return {"enabled":True,"positive":sc>0,"abuseConfidenceScore":sc,"totalReports":tr}
+    except Exception as e:
+        return {"enabled":True,"positive":False,"error":str(e),
+                "abuseConfidenceScore":0,"totalReports":0}
+
+
+def compute_ip_confidence(vt, otx, abuse):
+    pos = sum([vt.get("positive",False), otx.get("positive",False), abuse.get("positive",False)])
+    return {3:"High",2:"Medium",1:"Low",0:"Ignore"}.get(pos,"Ignore")
+
+
+def enrich_candidate_ips(candidate_ips):
+    high_conf, medium_conf = [], []
+    for item in candidate_ips:
+        ip = item.get("ip")
+        if not ip:
+            continue
+        vt, otx, abuse = lookup_virustotal(ip), lookup_otx(ip), lookup_abuseipdb(ip)
+        confidence     = compute_ip_confidence(vt, otx, abuse)
+        enriched       = {
+            **item,
+            "virustotal": {"malicious":vt.get("malicious",0),"suspicious":vt.get("suspicious",0)},
+            "otx":        {"pulse_count": otx.get("pulse_count",0)},
+            "abuseipdb":  {"abuseConfidenceScore":abuse.get("abuseConfidenceScore",0),
+                           "totalReports":abuse.get("totalReports",0)},
+            "confidence": confidence,
+        }
+        if confidence == "High":
+            enriched.update({"include_in_report":True,"include_in_dojo":True,
+                             "recommendation":"Confirmed malicious IP – candidate for blocklist review"})
+            high_conf.append(enriched)
+        elif confidence == "Medium":
+            enriched.update({"include_in_report":True,"include_in_dojo":False,
+                             "recommendation":"Suspicious IP – monitoring recommended"})
+            medium_conf.append(enriched)
+
+    return {"high_confidence": high_conf, "medium_confidence": medium_conf}
+
+
+def build_dojo_payload(canonical):
+    findings    = []
+    report_date = datetime.now().date().isoformat()
+
+    for agent_name, cves in canonical.get("agent_cves",{}).items():
+        for cve in cves:
+            refs = cve.get("references",[])
+            findings.append({
+                "title":             f"[Wazuh][{agent_name}] {cve.get('cve_id')}",
+                "severity":          cve.get("severity","High"),
+                "description":       f"Agent: {agent_name}\nPackage: {cve.get('package_name')} {cve.get('package_version')}\n\n{cve.get('description','')}",
+                "date":              report_date,
+                "cve":               cve.get("cve_id"),
+                "mitigation":        cve.get("mitigation"),
+                "references":        " ; ".join(refs) if isinstance(refs,list) else str(refs),
+                "component_name":    cve.get("package_name"),
+                "component_version": cve.get("package_version"),
+                "tags": ["wazuh", f"agent:{agent_name}", "source:wazuh"],
+            })
+
+    for item in canonical.get("malicious_ip_summary",{}).get("high_confidence",[]):
+        ip = item.get("ip")
+        vt, otx, abuse = item.get("virustotal",{}), item.get("otx",{}), item.get("abuseipdb",{})
+        findings.append({
+            "title":    f"[Wazuh][Malicious IP] {ip}",
+            "severity": "High",
+            "description": (
+                f"Malicious IP: {ip}\nAlert count: {item.get('alert_count',0)}\n"
+                f"VT malicious={vt.get('malicious',0)} suspicious={vt.get('suspicious',0)}\n"
+                f"OTX pulse_count={otx.get('pulse_count',0)}\n"
+                f"AbuseIPDB confidence={abuse.get('abuseConfidenceScore',0)}"
+            ),
+            "date":      report_date,
+            "mitigation": item.get("recommendation",""),
+            "references": f"https://www.virustotal.com/gui/ip-address/{ip}",
+            "tags":      ["wazuh","malicious-ip","confidence:high"],
+        })
+
+    return {"name": "Wazuh Report Dojo Import",
+            "type": "Generic Findings Import",
+            "findings": findings}
+
+
+def dojo_headers():
+    return {"Authorization": f"Token {settings.DEFECTDOJO_TOKEN}"}
+
+
+def find_dojo_product_id(product_name):
+    url = f"{settings.DEFECTDOJO_URL.rstrip('/')}/api/v2/products/"
+    r   = requests.get(url, headers=dojo_headers(),
+                       params={"name": product_name},
+                       verify=settings.DEFECTDOJO_VERIFY_SSL, timeout=60)
+    r.raise_for_status()
+    res = r.json().get("results",[])
+    if not res:
+        raise Exception(f"DefectDojo product not found: {product_name}")
+    return res[0]["id"]
+
+
+def find_dojo_engagement_id(product_id, engagement_name):
+    url = f"{settings.DEFECTDOJO_URL.rstrip('/')}/api/v2/engagements/"
+    r   = requests.get(url, headers=dojo_headers(),
+                       params={"name": engagement_name,"product": product_id},
+                       verify=settings.DEFECTDOJO_VERIFY_SSL, timeout=60)
+    r.raise_for_status()
+    res = r.json().get("results",[])
+    if not res:
+        raise Exception(f"DefectDojo engagement not found: {engagement_name}")
+    return res[0]["id"]
+
+
+def upload_dojo_payload(canonical, dojo_payload_path):
+    product_id    = find_dojo_product_id(canonical["meta"]["dojo"]["product"])
+    engagement_id = find_dojo_engagement_id(product_id, canonical["meta"]["dojo"]["engagement"])
+    url           = f"{settings.DEFECTDOJO_URL.rstrip('/')}/api/v2/import-scan/"
+
+    with open(dojo_payload_path,"rb") as f:
+        r = requests.post(url,
+                          headers=dojo_headers(),
+                          data={"engagement": str(engagement_id),
+                                "scan_type":  "Generic Findings Import",
+                                "scan_date":  datetime.now().date().isoformat(),
+                                "verified":   "true", "active": "true",
+                                "minimum_severity": "Info"},
+                          files={"file": ("dojo_payload.json", f, "application/json")},
+                          verify=settings.DEFECTDOJO_VERIFY_SSL, timeout=180)
+    if not r.ok:
+        raise Exception(f"Dojo import failed {r.status_code}: {r.text}")
+    return {"product_id": product_id, "engagement_id": engagement_id,
+            "response": r.json() if r.text else {}}
+
+
+# MAIN ENTRY POINT
+
+def build_canonical_dataset(payload: dict) -> dict:
+    period = resolve_period(payload)
+    top_n  = int(payload.get("top_n", settings.DEFAULT_TOP_N))
+
+    print("[INFO] Fetching vulnerability summary...")
+    vuln_summary = fetch_vulnerability_summary()
+
+    print("[INFO] Fetching all agents grouped by severity...")
+    all_agents_grouped = fetch_all_agents_with_severity(top_n=200)
+    top_agents         = fetch_top_agents(all_agents_grouped, top_n=top_n)
+
+    print(f"[INFO] Fetching CVE detail for top {len(top_agents)} agents...")
+    agent_cves = {}
+    for agent in top_agents:
+        name = agent.get("agent_name")
+        if name:
+            print(f"  → {name}")
+            cves = fetch_top_cves_for_agent(name, top_n=top_n)
+            agent_cves[name] = cves
+            scores = [c["cvss"] for c in cves if c.get("cvss") is not None]
+            if scores:
+                agent["max_cvss"] = round(max(scores), 2)
+                agent["avg_cvss"] = round(sum(scores)/len(scores), 2)
+
+    print("[INFO] Fetching DDoS alert candidates...")
+    candidate_ips = fetch_alert_candidates(
+        period=period, top_n=50,
+        groups=payload.get("ddos_rule_groups",["attack","web","accesslog"])
+    )
+
+    print(f"[INFO] Enriching {len(candidate_ips)} candidate IPs via Threat Intel...")
+    ti_enriched = enrich_candidate_ips(candidate_ips)
+
+    canonical = {
+        "meta": {
+            "report_name": payload.get("report_name","Wazuh Security Report"),
+            "period":      period,
+            "timezone":    payload.get("timezone", settings.DEFAULT_TIMEZONE),
+            "generated_at":datetime.now().isoformat(),
+            "top_n":       top_n,
+            "output_format":payload.get("output_format","pdf"),
+            "dojo": {
+                "product":    payload.get("dojo_product", settings.DEFECTDOJO_PRODUCT),
+                "engagement": payload.get("dojo_engagement", settings.DEFECTDOJO_ENGAGEMENT),
+            }
+        },
+        "vulnerability_summary":  {**vuln_summary, "top_n_agents": top_n},
+        "all_agents_grouped":     all_agents_grouped,
+        "top_agents":             top_agents,
+        "agent_cves":             agent_cves,
+        "malicious_ip_summary": {
+            "candidate_ips":     candidate_ips,
+            "high_confidence":   ti_enriched["high_confidence"],
+            "medium_confidence": ti_enriched["medium_confidence"],
+        },
+        "dojo_summary": {
+            "planned_total_findings":          sum(len(v) for v in agent_cves.values()) + len(ti_enriched["high_confidence"]),
+            "planned_vulnerability_findings":  sum(len(v) for v in agent_cves.values()),
+            "planned_malicious_ip_findings":   len(ti_enriched["high_confidence"]),
+            "skipped_medium_ip_findings":      len(ti_enriched["medium_confidence"]),
+            "import_status": "pending",
+        }
+    }
+    return canonical
+
+
+def run_report_real_vuln(payload: dict) -> dict:
+    now          = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    pdf_filename = f"wazuh_report_{now}.pdf"
+    pdf_path     = OUTPUT_DIR / pdf_filename
+
+    canonical = build_canonical_dataset(payload)
+
+    # DefectDojo payload
+    dojo_payload      = build_dojo_payload(canonical)
+    dojo_payload_path = TMP_DIR / "dojo_payload.json"
+    dojo_payload_path.write_text(json.dumps(dojo_payload, indent=2))
+
+    dojo_import_status = "pending"
+    dojo_import_detail = None
+    try:
+        dojo_import_detail = upload_dojo_payload(canonical, dojo_payload_path)
+        dojo_import_status = "success"
+    except Exception as e:
+        dojo_import_status = "failed"
+        dojo_import_detail = {"error": str(e)}
+
+    canonical["dojo_summary"]["import_status"] = dojo_import_status
+
+    # Save canonical
+    canonical_path = TMP_DIR / "canonical_dataset.json"
+    canonical_path.write_text(json.dumps(canonical, indent=2, default=str))
+
+    print("[INFO] Generating PDF report...")
+    generate_pdf_report(canonical, pdf_path)
+    print(f"[INFO] PDF saved: {pdf_path}")
+
+    summary = canonical["vulnerability_summary"]
+    return {
+        "status":  "success" if dojo_import_status == "success" else "partial_success",
+        "message": "Report generated successfully",
+        "report": {
+            "name":           canonical["meta"]["report_name"],
+            "period":         canonical["meta"]["period"],
+            "output_format":  "pdf",
+            "pdf_filename":   pdf_filename,
+            "pdf_path":       str(pdf_path),
+            "pdf_url":        f"http://localhost:8008/download/{pdf_filename}",
+        },
+        "summary": {
+            "affected_agents":      summary["total_agents_affected"],
+            "critical_findings":    summary["critical_count"],
+            "high_findings":        summary["high_count"],
+            "candidate_ips":        len(canonical["malicious_ip_summary"]["candidate_ips"]),
+            "high_confidence_ips":  len(canonical["malicious_ip_summary"]["high_confidence"]),
+            "medium_confidence_ips":len(canonical["malicious_ip_summary"]["medium_confidence"]),
+        },
+        "dojo": {
+            "product":                         canonical["meta"]["dojo"]["product"],
+            "engagement":                      canonical["meta"]["dojo"]["engagement"],
+            "planned_total_findings":          canonical["dojo_summary"]["planned_total_findings"],
+            "planned_vulnerability_findings":  canonical["dojo_summary"]["planned_vulnerability_findings"],
+            "planned_malicious_ip_findings":   canonical["dojo_summary"]["planned_malicious_ip_findings"],
+            "skipped_medium_ip_findings":      canonical["dojo_summary"]["skipped_medium_ip_findings"],
+            "import_status":                   dojo_import_status,
+            "detail":                          dojo_import_detail,
+        },
+        "artifacts": {
+            "canonical_dataset_path": str(canonical_path),
+            "dojo_payload_path":      str(dojo_payload_path),
+        }
+    }
