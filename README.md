@@ -1,24 +1,26 @@
-# Security Report WIth Wazuh and DefectDojo
+# Security Reporting with Wazuh and DefectDojo
 
-Everybody knows that Wazuh was an powerful security tools, Wazuh can detect all treat in all of Wazuh agents. Here i would like to use DefectDojo as an vulnerability management platform to register all treat analys and made an reports, DefectDojo having limitation where it only made report as HTML file based, it was good, but for some reason adn reporting somtimes we wanna made it as legal document like file in pdf format, and i will use python script to handle it.
+Wazuh is widely recognized as a powerful security platform capable of detecting threats across all managed agents. In this project, I utilize DefectDojo as a vulnerability management platform to consolidate threat analysis and generate structured reports.
 
-## 1. How To Made an pdf Report
-The first thing we must to to is running the pytho script
+While DefectDojo’s native reporting is limited to HTML format, certain administrative or legal requirements often necessitate PDF documentation. To bridge this gap, I have implemented a Python-based automation script to handle the conversion and generation of these PDF reports.
+
+## 1. How to Generate a PDF Report
+To begin, you must activate the virtual environment and install the required dependencies, then initialize the FastAPI server.
 ```sh
+# Activate virtual environment and install dependencies
 source venv/bin/activate
 pip install fastapi uvicorn python-dotenv requests jinja2 reportlab pydantic matplotlib
 
-# Run the python script
-# in app/ directory
+# Start the application (from the app/ directory)
 uvicorn app.main:app --host 0.0.0.0 --port 8008
 ```
-Health check
+Health check, Verify that the service is running correctly:
 ```sh
 curl http://localhost:8008/health | python3 -m json.tool
 ```
-Trigger report
+Triggering a Report, You can trigger report generation via an HTTP POST request. Below are two common methods:
 ```sh
-# Preset Mode (last month)
+# Preset Mode (Last Month)
 curl -X POST "http://localhost:8008/run-report" \
   -H "Content-Type: application/json" \
   -d '{
@@ -36,7 +38,7 @@ curl -X POST "http://localhost:8008/run-report" \
     "output_format": "pdf"
   }' | python3 -m json.tool
 
-# Custom Mode (Spesify date)
+# Custom Mode (Specific Date Range)
 curl -X POST "http://localhost:8008/run-report" \
   -H "Content-Type: application/json" \
   -d '{
@@ -55,15 +57,18 @@ curl -X POST "http://localhost:8008/run-report" \
     "output_format": "pdf"
   }' | python3 -m json.tool
 ```
-The pdf result will be shown at output/ directory, like **~/app/output/wazuh_report_2026-04-23_08-52-19.pdf**.
+he generated PDF will be saved in the **output/** directory, for example: **~/app/output/wazuh_report_2026-04-23_08-52-19.pdf**.
 
-## 2. What Next?
-- (Normally) Schedulling with CronJob, or
-- (Advanced) Integrate with Shuffle as trigger HTTP POST of payload
-- (Recommended) Made as container, or
-- (Optional) Create Service as systemd
+## 2. Next Steps & Deployment Options
+To move this project into production, consider the following deployment strategies:
+- Automation: Schedule the script using CronJobs.
+- SOAR Integration (Advanced): Use Shuffle to trigger the HTTP POST payload as part of an automated workflow.
+- Containerization (Recommended): Package the application as a Docker container for better portability.
+- Systemd Service (Optional): Run the application as a background service on Linux.
+
+Configuration for Systemd, To set up the script as a system service, create the following unit file:
 ```sh
-# Create Systemd service
+# Create Systemd service file
 cat << EOF || sudo tee /etc/systemd/system/wazuh-report-worker.service 
 [Unit]
 Description=Wazuh Report Worker
@@ -81,7 +86,7 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-# Run as systemd
+# Enable and start the service
 systemctl daemon-reload
 systemctl enable --now wazuh-report-worker
 systemctl status wazuh-report-worker
