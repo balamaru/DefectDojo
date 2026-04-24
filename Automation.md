@@ -133,3 +133,29 @@ sudo systemctl start wazuh-report-generate.service
 cat $HOME/wazuh-report-worker/logs/last_report_response.json | python3 -m json.tool
 ls -la $HOME/wazuh-report-worker/output/
 ```
+
+## 6. Troubleshoot
+Everytimes do update to the script, we need to stop services first
+```sh
+sudo systemctl stop wazuh-report-worker.service
+sudo systemctl stop wazuh-report-generate.service
+```
+But when we start again, there is some issue from service wazuh-report-generate.timer
+```sh
+systemctl list-timers --all | grep wazuh
+
+# Output
+-                                       - Thu 2026-04-23 13:41:29 WIB            - wazuh-report-
+```
+Handle this issue with restart the service
+```sh
+# Check Status 
+sudo systemctl status wazuh-report-generate.timer
+
+# Restart
+sudo systemctl daemon-reload
+sudo systemctl restart wazuh-report-generate.timer
+
+# Verify
+systemctl list-timers --all | grep wazuh
+```
