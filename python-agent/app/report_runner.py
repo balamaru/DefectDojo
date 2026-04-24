@@ -3,7 +3,6 @@
 report_runner.py — Final Merged Version
 Wazuh Vulnerability + DDoS Security Report
 
-Struktur data: mengikuti rekan (GitHub balamaru/DefectDojo)
 Tampilan     : Dark Navy + Orange theme, professional corporate
 Fitur tambahan:
   - Recommended Action per CVE (P1/P2/P3 + SLA + steps)
@@ -53,9 +52,7 @@ TMP_DIR    = Path("/home/bakti/wazuh-report-worker/tmp")
 
 warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 
-# ═══════════════════════════════════════════════════════════════════
 # COLOUR PALETTE  —  Dark Navy + Orange
-# ═══════════════════════════════════════════════════════════════════
 C_NAVY      = colors.HexColor("#0D1B2A")   # header utama
 C_NAVY2     = colors.HexColor("#1B2A3B")   # header sekunder
 C_ORANGE    = colors.HexColor("#E85D04")   # aksen utama
@@ -78,9 +75,7 @@ SEV_COLOR = {
     "Low":      C_LOW,
 }
 
-# ═══════════════════════════════════════════════════════════════════
 # RECOMMENDED ACTION ENGINE
-# ═══════════════════════════════════════════════════════════════════
 
 _ACTION_MATRIX = {
     ("Critical", "9+"): ("P1 — IMMEDIATE",  "Patch within 24 hours",
@@ -156,9 +151,7 @@ def get_recommended_action(severity: str, cvss: float = None,
     return {"priority": d[0], "sla": d[1], "actions": d[2]}
 
 
-# ═══════════════════════════════════════════════════════════════════
 # STYLE FACTORY
-# ═══════════════════════════════════════════════════════════════════
 
 def make_styles():
     def ps(name, **kw):
@@ -226,9 +219,7 @@ def make_styles():
     }
 
 
-# ═══════════════════════════════════════════════════════════════════
 # PAGE TEMPLATE  (header + footer + page number)
-# ═══════════════════════════════════════════════════════════════════
 
 def _draw_page(canvas, doc):
     w, h = A4
@@ -293,9 +284,7 @@ class WazuhDocTemplate(BaseDocTemplate):
                 self.notify("TOCEntry", (1, flowable.getPlainText(), self.page))
 
 
-# ═══════════════════════════════════════════════════════════════════
 # HELPER UTILITIES
-# ═══════════════════════════════════════════════════════════════════
 
 def _plot_to_image(fig, width=16*cm, height=7*cm):
     buf = BytesIO()
@@ -342,9 +331,7 @@ def _section(story, styles, num, title, subtitle=""):
     story.append(Spacer(1, 4))
 
 
-# ═══════════════════════════════════════════════════════════════════
 # CHARTS
-# ═══════════════════════════════════════════════════════════════════
 
 def chart_severity_bar(summary: dict):
     labels = ["Critical", "High"]
@@ -441,9 +428,7 @@ def chart_malicious_ip(malicious: dict):
     return _plot_to_image(fig, 12*cm, 6*cm)
 
 
-# ═══════════════════════════════════════════════════════════════════
 # SECTION BUILDERS
-# ═══════════════════════════════════════════════════════════════════
 
 def _build_cover(story, styles, canonical):
     meta    = canonical.get("meta", {})
@@ -926,9 +911,7 @@ def _build_dojo_summary(story, styles, canonical):
     story.append(nt)
 
 
-# ═══════════════════════════════════════════════════════════════════
 # MAIN PDF BUILDER
-# ═══════════════════════════════════════════════════════════════════
 
 def generate_pdf_report(canonical: dict, pdf_path: Path):
     styles      = make_styles()
@@ -957,9 +940,7 @@ def generate_pdf_report(canonical: dict, pdf_path: Path):
     doc.multiBuild(story)
 
 
-# ═══════════════════════════════════════════════════════════════════
 # DATA FETCHING  (struktur persis dari rekan — balamaru/DefectDojo)
-# ═══════════════════════════════════════════════════════════════════
 
 def dig(obj, path, default=None):
     cur = obj
@@ -1441,9 +1422,7 @@ def fetch_top_cves_for_agent(agent_name: str, top_n: int = 10) -> list:
     return items[:top_n]
 
 
-# ═══════════════════════════════════════════════════════════════════
 # CANONICAL DATASET + ENTRY POINT
-# ═══════════════════════════════════════════════════════════════════
 
 def build_canonical_dataset(payload: dict) -> dict:
     period = resolve_period(payload)
